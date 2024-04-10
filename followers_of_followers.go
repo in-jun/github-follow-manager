@@ -30,12 +30,7 @@ func getFollowersOfFollowers(chFollowing chan *github.User, ctx context.Context,
 				}
 
 				for _, followerFollower := range followerFollowers {
-					if filter(followerFollower) {
-
-						if followingSet[*followerFollower.Login] {
-							continue
-						}
-
+					if !followingSet[*followerFollower.Login] && filter(followerFollower) {
 						followingSet[*followerFollower.Login] = true
 						chFollowing <- followerFollower
 					}
