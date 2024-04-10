@@ -1,4 +1,4 @@
-# GitHub Follow Automation Tool
+# GitHub Follow Manager
 
 이 도구는 GitHub 사용자를 자동으로 팔로우하고 언팔로우하는 기능을 제공합니다.
 
