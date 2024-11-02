@@ -13,62 +13,54 @@ import (
 	"golang.org/x/oauth2"
 )
 
-func main() {
-	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+type GitHubManager struct {
+	client       *github.Client
+	ctx          context.Context
+	username     string
+	wg           *sync.WaitGroup
+	checkedUsers map[string]bool
+	usersMutex   sync.RWMutex
+}
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	fmt.Print("GitHub 토큰을 입력하세요: ")
-	var token string
-	fmt.Scan(&token)
-
-	client := github.NewClient(oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
+func NewGitHubManager(token string) (*GitHubManager, error) {
+	ctx := context.Background()
+	client := github.NewClient(oauth2.NewClient(ctx, oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)))
 
 	userInfo, _, err := client.Users.Get(ctx, "")
 	if err != nil {
-		fmt.Printf("Error fetching authenticated user information: %v\n", err)
-		return
+		return nil, fmt.Errorf("error fetching user info: %v", err)
 	}
 
-	filter := func(user *github.User) bool {
-		return true
-	}
-
-	followingChan := make(chan *github.User, 10)
-	go getFollowersOfFollowers(followingChan, ctx, client, *userInfo.Login, filter)
-
-	unfollowingChan := make(chan *github.User, 100)
-	go getUnfollowingUsers(unfollowingChan, ctx, &wg, client, *userInfo.Login)
-
-	go func() {
-		for {
-			unfollowedUser := <-unfollowingChan
-			client.Users.Unfollow(ctx, *unfollowedUser.Login)
-			fmt.Printf("Unfollowed user: %v\n", string(*unfollowedUser.Login))
-			time.Sleep(time.Second)
-		}
-	}()
-
-	for {
-		select {
-		case followedUser := <-followingChan:
-			client.Users.Follow(ctx, *followedUser.Login)
-			fmt.Printf("Followed user: %v\n", string(*followedUser.Login))
-			time.Sleep(time.Minute * 5)
-		case <-sigs:
-			wg.Wait()
-			return
-		}
-	}
+	return &GitHubManager{
+		client:       client,
+		ctx:          ctx,
+		username:     *userInfo.Login,
+		wg:           &sync.WaitGroup{},
+		checkedUsers: make(map[string]bool),
+	}, nil
 }
 
-func getFollowersOfFollowers(chFollowing chan *github.User, ctx context.Context, client *github.Client, username string, filter func(*github.User) bool) {
+func (gm *GitHubManager) Run() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	followingChan := make(chan *github.User, 10)
+	unfollowingChan := make(chan *github.User, 100)
+
+	go gm.handleFollowing(followingChan)
+	go gm.handleUnfollowing(unfollowingChan)
+	go gm.processUnfollowing(unfollowingChan)
+
+	<-sigs
+	gm.wg.Wait()
+}
+
+func (gm *GitHubManager) handleFollowing(followingChan chan *github.User) {
 	for {
-		followingList := getAllFollowingUsers(ctx, client, username)
-		followersList := getAllFollowersUsers(ctx, client, username)
+		followingList := gm.getAllUsers(gm.client.Users.ListFollowing)
+		followersList := gm.getAllUsers(gm.client.Users.ListFollowers)
 
 		followingSet := make(map[string]bool)
 		for _, user := range followingList {
@@ -76,126 +68,108 @@ func getFollowersOfFollowers(chFollowing chan *github.User, ctx context.Context,
 		}
 
 		for _, follower := range followersList {
-			if filter(follower) {
-				opts := &github.ListOptions{
-					Page:    1,
-					PerPage: 100,
-				}
-				followerFollowers, _, err := client.Users.ListFollowers(ctx, *follower.Login, opts)
-				if err != nil {
-					fmt.Printf("Error fetching follower list for %s: %v\n", *follower.Login, err)
-					continue
-				}
+			opts := &github.ListOptions{PerPage: 100}
+			followers, _, err := gm.client.Users.ListFollowers(gm.ctx, *follower.Login, opts)
+			if err != nil {
+				continue
+			}
 
-				for _, followerFollower := range followerFollowers {
-					if !followingSet[*followerFollower.Login] && filter(followerFollower) {
-						followingSet[*followerFollower.Login] = true
-						chFollowing <- followerFollower
-					}
+			for _, f := range followers {
+				if !followingSet[*f.Login] {
+					followingSet[*f.Login] = true
+					followingChan <- f
 				}
 			}
 		}
+		time.Sleep(time.Minute)
 	}
 }
 
-func getAllFollowersUsers(ctx context.Context, client *github.Client, username string) []*github.User {
-	var allFollowers []*github.User
-
-	opts := &github.ListOptions{
-		Page:    1,
-		PerPage: 100,
-	}
-
-	for {
-		followers, resp, err := client.Users.ListFollowers(ctx, username, opts)
-		if err != nil {
-			return nil
-		}
-
-		allFollowers = append(allFollowers, followers...)
-
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-
-	return allFollowers
-}
-
-func getAllFollowingUsers(ctx context.Context, client *github.Client, username string) []*github.User {
-	var allFollowing []*github.User
-
-	opts := &github.ListOptions{
-		Page:    1,
-		PerPage: 100,
-	}
-
-	for {
-		following, resp, err := client.Users.ListFollowing(ctx, username, opts)
-		if err != nil {
-			return nil
-		}
-
-		allFollowing = append(allFollowing, following...)
-
-		if resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-
-	return allFollowing
-}
-
-var checkedUsers = make(map[string]bool)
-var checkedUsersMutex sync.Mutex
-
-func getUnfollowingUsers(chUnfollowing chan *github.User, ctx context.Context, wg *sync.WaitGroup, client *github.Client, username string) {
+func (gm *GitHubManager) handleUnfollowing(unfollowingChan chan *github.User) {
 	for {
 		followerMap := make(map[string]bool)
-		followingList := getAllFollowingUsers(ctx, client, username)
-		followersList := getAllFollowersUsers(ctx, client, username)
+		followingList := gm.getAllUsers(gm.client.Users.ListFollowing)
+		followersList := gm.getAllUsers(gm.client.Users.ListFollowers)
 
 		for _, follower := range followersList {
 			followerMap[*follower.Login] = true
 		}
 
-		for _, followingUser := range followingList {
-			if !followerMap[*followingUser.Login] && !isCheckedUser(*followingUser.Login) {
-				setCheckedUser(*followingUser.Login, true)
-				wg.Add(1)
-				go func(user *github.User) {
-					defer wg.Done()
-					sigs := make(chan os.Signal, 1)
-					signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-					select {
-					case <-time.After(24 * time.Hour):
-						if !followerMap[*user.Login] {
-							chUnfollowing <- user
-						}
-						setCheckedUser(*user.Login, false)
-					case <-sigs:
-						if !followerMap[*user.Login] {
-							chUnfollowing <- user
-						}
-						setCheckedUser(*user.Login, false)
-					}
-				}(followingUser)
+		for _, following := range followingList {
+			if !followerMap[*following.Login] && !gm.isCheckedUser(*following.Login) {
+				gm.setCheckedUser(*following.Login, true)
+				gm.wg.Add(1)
+				go gm.checkUserAfterDelay(following, followerMap, unfollowingChan)
 			}
 		}
-		time.Sleep(time.Second * 30)
+		time.Sleep(30 * time.Second)
 	}
 }
 
-func setCheckedUser(login string, value bool) {
-	checkedUsersMutex.Lock()
-	defer checkedUsersMutex.Unlock()
-	checkedUsers[login] = value
+func (gm *GitHubManager) processUnfollowing(unfollowingChan chan *github.User) {
+	for user := range unfollowingChan {
+		gm.client.Users.Unfollow(gm.ctx, *user.Login)
+		fmt.Printf("Unfollowed user: %v\n", *user.Login)
+		time.Sleep(time.Second)
+	}
 }
 
-func isCheckedUser(login string) bool {
-	checkedUsersMutex.Lock()
-	defer checkedUsersMutex.Unlock()
-	return checkedUsers[login]
+func (gm *GitHubManager) checkUserAfterDelay(user *github.User, followerMap map[string]bool, unfollowingChan chan *github.User) {
+	defer gm.wg.Done()
+
+	select {
+	case <-time.After(24 * time.Hour):
+		if !followerMap[*user.Login] {
+			unfollowingChan <- user
+		}
+	case <-gm.ctx.Done():
+		return
+	}
+	gm.setCheckedUser(*user.Login, false)
+}
+
+func (gm *GitHubManager) getAllUsers(listFunc func(context.Context, string, *github.ListOptions) ([]*github.User, *github.Response, error)) []*github.User {
+	var allUsers []*github.User
+	opts := &github.ListOptions{PerPage: 100}
+
+	for {
+		users, resp, err := listFunc(gm.ctx, gm.username, opts)
+		if err != nil {
+			return nil
+		}
+
+		allUsers = append(allUsers, users...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allUsers
+}
+
+func (gm *GitHubManager) setCheckedUser(login string, value bool) {
+	gm.usersMutex.Lock()
+	defer gm.usersMutex.Unlock()
+	gm.checkedUsers[login] = value
+}
+
+func (gm *GitHubManager) isCheckedUser(login string) bool {
+	gm.usersMutex.RLock()
+	defer gm.usersMutex.RUnlock()
+	return gm.checkedUsers[login]
+}
+
+func main() {
+	fmt.Print("GitHub 토큰을 입력하세요: ")
+	var token string
+	fmt.Scan(&token)
+
+	manager, err := NewGitHubManager(token)
+	if err != nil {
+		fmt.Printf("Error creating GitHub manager: %v\n", err)
+		return
+	}
+
+	manager.Run()
 }
